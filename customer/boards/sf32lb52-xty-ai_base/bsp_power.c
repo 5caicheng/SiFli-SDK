@@ -24,7 +24,7 @@ __WEAK void BSP_PowerDownCustom(int coreid, bool is_deep_sleep)
 
 __WEAK void BSP_PowerUpCustom(bool is_deep_sleep)
 {
- 
+    HAL_PMU_ConfigPeriLdo(PMUC_PERI_LDO_EN_VDD33_LDO3_Pos, 1, 1);
 }
 
 
