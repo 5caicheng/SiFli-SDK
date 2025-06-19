@@ -194,13 +194,9 @@ static void BSP_PIN_Common(void)
     HAL_PIN_Set(PAD_PA18, USART1_RXD, PIN_PULLUP, 1);
     HAL_PIN_Set(PAD_PA19, USART1_TXD, PIN_PULLUP, 1);
 
-    // Key1 - Power key
-    /* Keep default pull-down unchanged. Uart download driver would use this function,
-     * if pulldown is disabled, download driver would not work on the board without external pull-down
-     */
-    // HAL_PIN_Set(PAD_PA34, GPIO_A34, PIN_NOPULL, 1);
-    // Key2
+    // Key1
     HAL_PIN_Set(PAD_PA11, GPIO_A11, PIN_NOPULL, 1);
+    // led1
     HAL_PIN_Set(PAD_PA32, GPIO_A32, PIN_NOPULL, 1);
 
     // PA22 #XTAL32K_XI
