@@ -91,7 +91,11 @@ config LCD_USING_ILI9341
 config LCD_USING_ILI9327
     bool
     default n
-    
+
+config LCD_USING_ST7789
+    bool
+    default n
+
 config LCD_USING_ST7789V
     bool
     default n
