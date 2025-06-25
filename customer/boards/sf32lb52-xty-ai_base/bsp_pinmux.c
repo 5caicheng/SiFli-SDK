@@ -195,7 +195,13 @@ static void BSP_PIN_Common(void)
     HAL_PIN_Set(PAD_PA19, USART1_TXD, PIN_PULLUP, 1);
 
     // Key1
+    HAL_PIN_Set(PAD_PA39, GPIO_A39, PIN_NOPULL, 1);
+    // Key2
     HAL_PIN_Set(PAD_PA11, GPIO_A11, PIN_NOPULL, 1);
+
+    HAL_PIN_Set(PAD_PA40, GPIO_A40, PIN_NOPULL, 1);
+    HAL_PIN_Set(PAD_PA38, GPIO_A38, PIN_NOPULL, 1);
+
     // led1
     HAL_PIN_Set(PAD_PA32, GPIO_A32, PIN_NOPULL, 1);
 
