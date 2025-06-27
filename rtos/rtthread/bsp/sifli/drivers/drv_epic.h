@@ -51,6 +51,7 @@
 
 #define DRV_EPIC_TIMEOUT_MS 500
 
+#define DRV_EPIC_POLYGON_POINT_MAX 16
 #ifndef DRV_EPIC_NEW_API
 
 typedef enum
@@ -123,6 +124,7 @@ typedef enum
     DRV_EPIC_DRAW_RECT,
     DRV_EPIC_DRAW_LINE,
     DRV_EPIC_DRAW_BORDER,
+    DRV_EPIC_DRAW_POLYGON,
     DRV_EPIC_DRAW_MAX,
     DRV_EPIC_INVALID = 0xFFFF,      //Invalid
 } drv_epic_op_type_t;
@@ -229,7 +231,12 @@ typedef struct
 
             uint32_t argb8888;
         } border;
-
+        struct
+        {
+            EPIC_PointTypeDef points[DRV_EPIC_POLYGON_POINT_MAX];
+            uint16_t point_cnt;
+            uint32_t argb8888;
+        } polygon;
     } desc;
 
     //Offset to specified dst buf, internal use only
@@ -336,7 +343,7 @@ rt_err_t drv_gpu_check_done(rt_int32_t ms);
  * @return        0 - if not cached  1 - cached
  */
 uint8_t drv_gpu_is_cached_ram(uint32_t start, uint32_t len);
-
+bool drv_epic_is_busy(void);
 #endif /* __DRV_EPIC_H__ */
 
 

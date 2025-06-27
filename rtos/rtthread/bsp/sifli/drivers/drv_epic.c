@@ -112,7 +112,6 @@
 
 #define rl_flag_commit         0x01
 #define rl_flag_rendering     0x02
-#define rl_flag_overwritting     0x04
 
 #define debug_rl_hist_num  8 //Set '0' to disable history
 
@@ -211,7 +210,8 @@ typedef struct
 
     struct rt_semaphore rl_sema;
     priv_render_list_t *render_list_pool;
-    priv_render_list_t *using_rl; //Committing rl
+    priv_render_list_t *using_rl_stack[render_list_pool_max]; //Committing rl stack
+    uint32_t using_rl_count; //Committing rl stack depth
 #if debug_rl_hist_num > 0
     uint32_t           hist_idx;
     priv_render_hist_t hist[debug_rl_hist_num];
@@ -252,6 +252,7 @@ typedef struct
 
     struct rt_thread task;
     rt_mq_t  mq;
+    uint8_t task_idle; //1: task is idle, 0: task is busy
 
 #endif /* DRV_EPIC_NEW_API */
 
@@ -2037,7 +2038,7 @@ void drv_epic_cont_blend_reset(void)
     cont_blend_reset();
 }
 
-#else
+#else /* DRV_EPIC_NEW_API */
 #define DRV_EPIC_ASSERT(expr) do{\
     if(!(expr)){print_gpu_error_info();\
     RT_ASSERT(expr);}\
@@ -2065,6 +2066,7 @@ static char *operation_name(drv_epic_op_type_t op)
         OP_TO_NAME_CASE(DRV_EPIC_DRAW_RECT);
         OP_TO_NAME_CASE(DRV_EPIC_DRAW_LINE);
         OP_TO_NAME_CASE(DRV_EPIC_DRAW_BORDER);
+        OP_TO_NAME_CASE(DRV_EPIC_DRAW_POLYGON);
 
     default:
         return "UNKNOW";
@@ -2167,6 +2169,12 @@ static void print_operation(const char *name, const drv_epic_operation *op)
               op->desc.border.top_side, op->desc.border.bot_side,
               op->desc.border.left_side, op->desc.border.right_side
              );
+    }
+    break;
+
+    case DRV_EPIC_DRAW_POLYGON:
+    {
+        LOG_E("argb:0x%08x, cnt:%d ", op->desc.polygon.argb8888, op->desc.polygon.point_cnt);
     }
     break;
 
@@ -2332,6 +2340,23 @@ static rt_err_t rl_sem_release(void)
     return err;
 }
 
+static void push_rl_stack(priv_render_list_t *rl)
+{
+    RT_ASSERT(drv_epic.using_rl_count < render_list_pool_max);
+    drv_epic.using_rl_stack[drv_epic.using_rl_count++] = rl;
+}
+
+static priv_render_list_t *pop_rl_stack(void)
+{
+    RT_ASSERT(drv_epic.using_rl_count > 0);
+    return drv_epic.using_rl_stack[--drv_epic.using_rl_count];
+}
+
+static priv_render_list_t *get_rl_from_stack(void)
+{
+    RT_ASSERT(drv_epic.using_rl_count > 0);
+    return drv_epic.using_rl_stack[drv_epic.using_rl_count - 1];
+}
 
 static void epic_cplt_callback(EPIC_HandleTypeDef *epic)
 {
@@ -4177,7 +4202,156 @@ static void render_layer(drv_epic_operation *p_operation, EPIC_LayerConfigTypeDe
         LOG_E(FORMATED_LAYER_INFO(dst, "DST"));
     }
 
-    render_image(p_operation, dst, p_clip_area);
+    if (HAL_EPIC_AreaWidth(p_clip_area) <= EPIC_COORDINATES_MAX)
+    {
+        render_image(p_operation, dst, p_clip_area);
+    }
+    else
+    {
+        EPIC_AreaTypeDef final_layer_clip_area;
+
+        final_layer_clip_area.y0 = p_clip_area->y0;
+        final_layer_clip_area.y1 = p_clip_area->y1;
+
+        /* Horizontal block rendering */
+        for (int16_t start_column = p_clip_area->x0; start_column <= p_clip_area->x1; start_column += EPIC_COORDINATES_MAX)
+        {
+            final_layer_clip_area.x0 = start_column;
+            if (start_column + EPIC_COORDINATES_MAX - 1 >= p_clip_area->x1)
+                final_layer_clip_area.x1 = p_clip_area->x1;
+            else
+                final_layer_clip_area.x1 = start_column + EPIC_COORDINATES_MAX - 1;
+
+            render_image(p_operation, dst, &final_layer_clip_area);
+        }
+    }
+}
+
+static rt_err_t render_polygon(drv_epic_operation *p_operation, EPIC_LayerConfigTypeDef *dst, const EPIC_AreaTypeDef *p_clip_area)
+{
+    uint32_t point_cnt = p_operation->desc.polygon.point_cnt;
+
+    EPIC_AreaTypeDef clip_area;
+    if (!HAL_EPIC_AreaIntersect(&clip_area, &p_operation->clip_area, p_clip_area)) return RT_EOK;
+
+    void **mask_list = rt_malloc((point_cnt + 1) * sizeof(void *));
+    drv_epic_mask_line_param_t *mp = rt_malloc(point_cnt * sizeof(drv_epic_mask_line_param_t));
+    drv_epic_mask_line_param_t *mp_next = mp;
+    RT_ASSERT(mask_list);
+    RT_ASSERT(mp);
+    EPIC_PointTypeDef *points = p_operation->desc.polygon.points;
+    /*Find the lowest point*/
+    int16_t y_min = points[0].y;
+    int16_t y_min_i = 0;
+
+    for (int16_t i = 1; i < point_cnt; i++)
+    {
+        if (points[i].y < y_min)
+        {
+            y_min = points[i].y;
+            y_min_i = i;
+        }
+    }
+
+    int32_t i_prev_left = y_min_i;
+    int32_t i_prev_right = y_min_i;
+    int32_t i_next_left;
+    int32_t i_next_right;
+    uint32_t mask_cnt = 0;
+
+    /*Get the index of the left and right points*/
+    i_next_left = y_min_i - 1;
+    if (i_next_left < 0) i_next_left = point_cnt + i_next_left;
+
+    i_next_right = y_min_i + 1;
+    if (i_next_right > point_cnt - 1) i_next_right = 0;
+
+    /**
+     * Check if the order of points is inverted or not.
+     * The normal case is when the left point is on `y_min_i - 1`
+     * Explanation:
+     *   if angle(p_left) < angle(p_right) -> inverted
+     *   dy_left/dx_left < dy_right/dx_right
+     *   dy_left * dx_right < dy_right * dx_left
+     */
+    int16_t dxl = points[i_next_left].x - points[y_min_i].x;
+    int16_t dxr = points[i_next_right].x - points[y_min_i].x;
+    int16_t dyl = points[i_next_left].y - points[y_min_i].y;
+    int16_t dyr = points[i_next_right].y - points[y_min_i].y;
+
+    bool inv = false;
+    if (dyl * dxr < dyr * dxl) inv = true;
+    uint16_t make_index = 0;
+    do
+    {
+        if (!inv)
+        {
+            i_next_left = i_prev_left - 1;
+            if (i_next_left < 0) i_next_left = point_cnt + i_next_left;
+
+            i_next_right = i_prev_right + 1;
+            if (i_next_right > point_cnt - 1) i_next_right = 0;
+        }
+        else
+        {
+            i_next_left = i_prev_left + 1;
+            if (i_next_left > point_cnt - 1) i_next_left = 0;
+
+            i_next_right = i_prev_right - 1;
+            if (i_next_right < 0) i_next_right = point_cnt + i_next_right;
+        }
+
+        if (points[i_next_left].y >= points[i_prev_left].y)
+        {
+            if (points[i_next_left].y != points[i_prev_left].y &&
+                    points[i_next_left].x != points[i_prev_left].x)
+            {
+                drv_epic_mask_line_points_init(mp_next, points[i_prev_left].x, points[i_prev_left].y,
+                                               points[i_next_left].x, points[i_next_left].y,
+                                               DRAW_MASK_LINE_SIDE_RIGHT);
+                mask_list[make_index++] = mp_next;
+                mp_next++;
+            }
+            mask_cnt++;
+            i_prev_left = i_next_left;
+        }
+
+        if (mask_cnt == point_cnt) break;
+
+        if (points[i_next_right].y >= points[i_prev_right].y)
+        {
+            if (points[i_next_right].y != points[i_prev_right].y &&
+                    points[i_next_right].x != points[i_prev_right].x)
+            {
+
+                drv_epic_mask_line_points_init(mp_next, points[i_prev_right].x, points[i_prev_right].y,
+                                               points[i_next_right].x, points[i_next_right].y,
+                                               DRAW_MASK_LINE_SIDE_LEFT);
+                mask_list[make_index++] = mp_next;
+                mp_next++;
+            }
+            mask_cnt++;
+            i_prev_right = i_next_right;
+        }
+
+    }
+    while (mask_cnt < point_cnt);
+    mask_list[make_index] = NULL;
+
+    if (p_operation->mask.data) render_lock(p_operation->op, 0, 0, (uint32_t)(p_operation->mask.data));
+
+    draw_masked_rect(dst, &p_operation->mask,
+                     mask_list, &clip_area, p_operation->desc.polygon.argb8888,
+                     NULL, NULL, NULL, 0);
+
+    if (p_operation->mask.data) render_unlock();
+
+    for (int16_t i = 0; i < make_index; i++) drv_epic_mask_free_param(mask_list[i]);
+
+    rt_free(mask_list);
+    rt_free(mp);
+
+    return RT_EOK;
 }
 
 static rt_err_t render(drv_epic_render_list_t list)
@@ -4259,6 +4433,10 @@ static rt_err_t render(drv_epic_render_list_t list)
                     render_border(p_operation, dst, &intersect_area);
                     break;
 
+                case DRV_EPIC_DRAW_POLYGON:
+                    render_polygon(p_operation, dst, &intersect_area);
+                    break;
+
                 default:
                     RT_ASSERT(0);
                     break;
@@ -4298,7 +4476,50 @@ static rt_err_t render_list(priv_render_list_t *rl)
 
     rt_err_t ret;
 
-    ret = render((drv_epic_render_list_t)rl);
+    /* If both the width and height do not exceed the maximum values, render directly. */
+    if (rl->dst.width <= EPIC_COORDINATES_MAX && rl->dst.height <= EPIC_COORDINATES_MAX)
+    {
+        return render((drv_epic_render_list_t)rl);
+    }
+    else
+    {
+        /* The current rendering area, that is, the rendering area after block division */
+        EPIC_AreaTypeDef render_area;
+        /* Before block rendering, the original data should be backed up first. After the block division is completed,
+           the data will be restored, and these data will be used for subsequent operations.*/
+        EPIC_LayerConfigTypeDef dst = rl->dst;
+
+        /* Calculate the maximum value of rows/columns */
+        int16_t max_columns = rl->dst.x_offset + rl->dst.width - 1;
+        int16_t max_rows = rl->dst.y_offset + rl->dst.height - 1;
+
+        /* Vertical block rendering */
+        for (int16_t start_rows = dst.y_offset; start_rows <= max_rows; start_rows += EPIC_COORDINATES_MAX)
+        {
+            render_area.y0 = start_rows;
+
+            if (start_rows + EPIC_COORDINATES_MAX - 1 >= max_rows)
+                render_area.y1 = max_rows;
+            else
+                render_area.y1 = start_rows + EPIC_COORDINATES_MAX - 1;
+
+            /* Horizontal block rendering */
+            for (int16_t start_columns = dst.x_offset; start_columns <= max_columns; start_columns += EPIC_COORDINATES_MAX)
+            {
+                render_area.x0 = start_columns;
+
+                if (start_columns + EPIC_COORDINATES_MAX - 1 >= max_columns)
+                    render_area.x1 = max_columns;
+                else
+                    render_area.x1 = start_columns + EPIC_COORDINATES_MAX - 1;
+
+                clip_layer_to_area((EPIC_BlendingDataType *)&rl->dst, (const uint8_t *)dst.data, dst.x_offset, dst.y_offset, &render_area);
+
+                ret = render((drv_epic_render_list_t)rl);
+            }
+        }
+        rl->dst = dst;
+    }
 
     __DEBUG_RENDER_LIST_END__;
 
@@ -4310,10 +4531,7 @@ static rt_err_t lock_render_list(drv_epic_render_list_t list)
     priv_render_list_t *rl = (priv_render_list_t *) list;
 
     rt_enter_critical();
-    if (0 == (rl->flag & rl_flag_overwritting))
-        rl->flag |= rl_flag_rendering;
-    else
-        rl->flag &= ~rl_flag_commit;
+    rl->flag |= rl_flag_rendering;
     rt_exit_critical();
     return RT_EOK;
 }
@@ -4465,7 +4683,9 @@ static void epic_task(void *param)
 
     while (1)
     {
+        p_drv_epic->task_idle = 1;
         err = rt_mq_recv(p_drv_epic->mq, &msg, sizeof(msg), RT_WAITING_FOREVER);
+        p_drv_epic->task_idle = 0;
 
         RT_ASSERT(RT_EOK == err);
 
@@ -4543,6 +4763,18 @@ static void epic_task(void *param)
                             p_drv_epic->cur_buf = (uint8_t *)p_drv_epic->buf1;
 
                         p_dst->data = p_drv_epic->cur_buf;
+                    }
+                    else
+                    {
+                        LOG_E("Render list failed, the render list has not intersect with the dst layer area typically.");
+                        print_rl(rl);
+
+                        if (p_RenderDrawctx->partial_done_cb)
+                        {
+                            uint32_t usr_cb_start_ms = rt_tick_get_millisecond();
+                            p_RenderDrawctx->partial_done_cb(rl, p_dst, p_RenderDrawctx->usr_data, last);
+                            p_drv_epic->rd_usr_cb_total += rt_tick_get_millisecond() - usr_cb_start_ms;
+                        }
                     }
                 }
 
@@ -4881,7 +5113,6 @@ rt_err_t drv_epic_setup_render_buffer(uint8_t *buf1, uint8_t *buf2, uint32_t buf
 
 drv_epic_render_list_t drv_epic_alloc_render_list(drv_epic_render_buf *p_buf, EPIC_AreaTypeDef *p_ow_area)
 {
-    priv_render_list_t *rl_overwrite = NULL;
     priv_render_list_t *rl_ret = NULL;
 
     rl_sem_take(GPU_BLEND_EXP_MS);
@@ -4899,21 +5130,9 @@ drv_epic_render_list_t drv_epic_alloc_render_list(drv_epic_render_buf *p_buf, EP
             rl_ret = rl;
             break;
         }
-        else if (0 == (rl_flag_rendering & rl->flag))
-        {
-            //Make sure all operations were commited.
-            RT_ASSERT(rl->src_list_len == rl->src_list_alloc_len);
-            rl->src_list_alloc_len = 0;
-            rl->src_list_len = 0;
-            rl->letter_pool_free = 0;
-            rl->flag |= rl_flag_overwritting;
-            rl_overwrite = rl;
-        }
     }
     rt_exit_critical();
     RT_ASSERT(rl_ret);
-
-    if (rl_overwrite && !rl_ret) rl_ret = rl_overwrite;
 
     if (rl_ret)
     {
@@ -4929,9 +5148,15 @@ drv_epic_render_list_t drv_epic_alloc_render_list(drv_epic_render_buf *p_buf, EP
         rl_ret->dst.y_offset    = p_buf->area.y0;
 
         if (p_ow_area) HAL_EPIC_AreaCopy(p_ow_area, &rl_ret->commit_area);
+        push_rl_stack(rl_ret);
+    }
+    else
+    {
+        LOG_E("Render list pool is full!");
+        return NULL;
     }
 
-    drv_epic.using_rl = rl_ret;
+
     return (drv_epic_render_list_t)rl_ret;
 }
 
@@ -4969,7 +5194,7 @@ drv_epic_operation *drv_epic_alloc_op(drv_epic_render_buf *p_buf)
         }
     }
 #else
-    rl = drv_epic.using_rl;
+    rl = get_rl_from_stack();
     RT_ASSERT(rl);
     RT_ASSERT(0 == (rl->flag & rl_flag_rendering));
 
@@ -5072,7 +5297,7 @@ drv_epic_operation *drv_epic_alloc_op(drv_epic_render_buf *p_buf)
 
 rt_err_t drv_epic_commit_op(drv_epic_operation *op)
 {
-    priv_render_list_t *rl = drv_epic.using_rl;
+    priv_render_list_t *rl = get_rl_from_stack();
 
     RT_ASSERT(rl);
     RT_ASSERT(0 == (rl->flag & (rl_flag_rendering)));
@@ -5207,7 +5432,7 @@ __COMMIT_OPERATION:
 
 drv_epic_letter_type_t *drv_epic_op_alloc_letter(drv_epic_operation *op)
 {
-    priv_render_list_t *rl = drv_epic.using_rl;
+    priv_render_list_t *rl = get_rl_from_stack();
 
     RT_ASSERT(rl);
     RT_ASSERT(0 == (rl->flag & (rl_flag_rendering)));
@@ -5240,6 +5465,7 @@ rt_err_t drv_epic_render_msg_commit(EPIC_MsgTypeDef *p_msg)
     bool send_msg;
     priv_render_list_t *rl = (priv_render_list_t *)p_msg->render_list;
     RT_ASSERT(rl->src_list_len == rl->src_list_alloc_len);
+    RT_ASSERT(rl == get_rl_from_stack());
 
     rt_enter_critical();
     if (rl_flag_commit & rl->flag)
@@ -5250,7 +5476,6 @@ rt_err_t drv_epic_render_msg_commit(EPIC_MsgTypeDef *p_msg)
     else
         send_msg = true;
     rl->flag |= rl_flag_commit;
-    rl->flag &= ~rl_flag_overwritting;
     rt_exit_critical();
 
     if (EPIC_MSG_RENDER_DRAW == p_msg->id)
@@ -5258,6 +5483,7 @@ rt_err_t drv_epic_render_msg_commit(EPIC_MsgTypeDef *p_msg)
         HAL_EPIC_AreaCopy(&rl->commit_area, &p_msg->content.rd.area);
     }
 
+    pop_rl_stack();
     if (send_msg)
     {
         rt_err_t err;
@@ -5296,6 +5522,25 @@ static rt_err_t drv_epic_render_list_init(void)
     return RT_EOK;
 }
 #endif /*DRV_EPIC_NEW_API*/
+
+bool drv_epic_is_busy(void)
+{
+    if (0 == drv_epic_inited) return false;
+
+#ifdef DRV_EPIC_NEW_API
+    if (drv_epic.mq) if (drv_epic.mq->entry > 0) return true;
+    if (drv_epic.task_idle != 1) return true;
+#endif /* DRV_EPIC_NEW_API*/
+
+    if (-RT_ETIMEOUT == epic_sem_trytake())
+        return true;
+    else
+    {
+        epic_sem_release();
+        return false;
+    }
+}
+
 
 int drv_epic_init(void)
 {
